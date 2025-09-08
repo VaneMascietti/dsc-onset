@@ -29,6 +29,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import patheffects as pe
+try:
+    from scipy.signal import savgol_filter as _savgol
+except Exception:
+    _savgol = None
 
 
 # ---------- Lectura robusta de TRIOS ----------
@@ -158,7 +162,9 @@ def integrate_area_from_onset(time, hf, base, t_on, r, endo=False):
     mask = (time >= t_on) & (time <= time[r])
     if np.sum(mask) < 2:
         return 0.0
-    area = float(np.trapezoid(rel[mask], time[mask]) * 60.0)  # J g^-1
+    # Integración del exceso de flujo de calor desde el onset hasta r
+    # Usar np.trapz para compatibilidad con NumPy antiguos (equivalente a trapezoid)
+    area = float(np.trapz(rel[mask], time[mask]) * 60.0)  # J g^-1
     return -abs(area) if endo else abs(area)
 
 
@@ -199,37 +205,135 @@ def format_du(x):
 PE_HALO = [pe.withStroke(linewidth=3, foreground="white", alpha=0.9)]
 
 
+# ---------- Suavizado robusto (minutos) ----------
+def _smooth_minutes(time, y, win_min: float) -> np.ndarray:
+    """Suaviza 'y' en ventanas ~win_min (min), conservando forma del frente.
+    Usa Savitzky-Golay si está disponible; si no, media móvil.
+    """
+    if win_min <= 0:
+        return y
+    dt = np.median(np.diff(time)) if len(time) > 1 else 0.01
+    if dt <= 0:
+        return y
+    w = int(round(win_min / dt))
+    w = max(5, w | 1)  # impar y >=5
+    if _savgol is not None and w >= 7:
+        return _savgol(y, window_length=w, polyorder=2, mode="interp")
+    pad = w // 2
+    yy = np.pad(y, (pad, pad), mode="edge")
+    ker = np.ones(w) / w
+    return np.convolve(yy, ker, mode="valid")
+
+
+# ---------- Detección de onset por método de la tangente ----------
+def detect_onset_first_cross(
+    time, hf, *, endo: bool,
+    tmin=None, tmax=None,
+    smooth_min: float = 0.25,
+    base_pre_min: float = 1.5,
+    base_gap_min: float = 0.3,
+    sigma_k: float = 3.0,
+    consec: int = 5,
+    edge_halfwin_pts: int = 8,
+):
+    """
+    Devuelve: t_on (min), idx_on, (mb, bb)=base, (mt, bt)=tangente.
+    """
+    mask = np.ones_like(time, dtype=bool)
+    if tmin is not None:
+        mask &= (time >= tmin)
+    if tmax is not None:
+        mask &= (time <= tmax)
+    t = time[mask]
+    y = hf[mask]
+    if t.size < 5:
+        idx_on = int(np.argmax(-y if endo else y))
+        t_on = float(t[idx_on])
+        return t_on, int(np.clip(np.searchsorted(time, t_on), 1, len(time)-1)), (0.0, float(y[0])), (0.0, float(y[0]))
+
+    ys = _smooth_minutes(t, y, smooth_min)
+    dydt = np.gradient(ys, t)
+
+    # frente provisional
+    k_front = int(np.argmin(dydt) if endo else np.argmax(dydt))
+    t_star = float(t[k_front])
+
+    # base antes del frente
+    t1 = t_star - float(base_gap_min)
+    t0 = t1 - float(base_pre_min)
+    base_mask = (t >= t0) & (t <= t1)
+    if base_mask.sum() < 8:
+        t0 = max(float(t.min()), t0 - 0.5*float(base_pre_min))
+        base_mask = (t >= t0) & (t <= t1)
+    mb, bb = np.polyfit(t[base_mask], y[base_mask], 1)
+
+    # umbral robusto desde la base
+    resid_base = (ys - (mb*t + bb))[base_mask]
+    med = float(np.median(resid_base))
+    mad = float(np.median(np.abs(resid_base - med))) + 1e-12
+    sigma = 1.4826 * mad
+    thr = float(sigma_k) * sigma
+
+    s = -1.0 if endo else 1.0
+    j0 = int(np.searchsorted(t, t1))
+    j_on = None
+    for j in range(j0, len(t) - consec):
+        seg = s * (ys[j:j+consec] - (mb*t[j:j+consec] + bb))
+        good = (seg > thr).all()
+        slope_ok = (s * dydt[j:j+consec] > 0).all()
+        if good and slope_ok:
+            j_on = j
+            break
+    if j_on is None:
+        j_on = k_front
+
+    # tangente local para refinar
+    i0 = max(0, j_on - edge_halfwin_pts)
+    i1 = min(len(t)-1, j_on + edge_halfwin_pts)
+    mt, bt = np.polyfit(t[i0:i1+1], ys[i0:i1+1], 1)
+
+    denom = (mb - mt)
+    t_on = float(t[j_on]) if denom == 0 else float((bt - bb) / denom)
+    if not (float(t.min()) - 1e-6 <= t_on <= float(t.max()) + 1e-6):
+        t_on = float(t[j_on])
+
+    idx_on = int(np.clip(np.searchsorted(time, t_on), 1, len(time)-1))
+    return float(t_on), idx_on, (float(mb), float(bb)), (float(mt), float(bt))
+
 def plot_dsc(df: pd.DataFrame, outstem: Path, use_points: bool, endo: bool,
              xlim=None, title: str | None = None, legend_state: str = "on",
              topline: bool = False, window=None, smooth: float = 0.1,
              width_in: float = 3.33, height_in: float = 2.6, dpi: int = 600,
              use_hatch: bool = False, edge_points: int = 12,
-             edges: bool = False, area_state: str = "off"):
+             edges: bool = False, area_state: str = "off",
+             base_pre: float = 1.5, base_gap: float = 0.3,
+             sigma_k: float = 3.0, consec: int = 5, edge_halfwin: int = 8,
+             show_time: bool = False):
 
     time = df["time_min"].to_numpy()
     temp = df["temp_c"].to_numpy()
     hf   = df["hf_wpg"].to_numpy()
 
-    # Ventana de búsqueda del pico: automática o forzada por CLI
-    if window and len(window) == 2:
-        wmask = (time >= window[0]) & (time <= window[1])
-        if np.any(wmask):
-            l_loc, peak_loc, r_loc = find_peak_and_window(time[wmask], hf[wmask], endo=endo, smooth_width_min=smooth)
-            idxs = np.where(wmask)[0]
-            l, peak, r = idxs[l_loc], idxs[peak_loc], idxs[r_loc]
-        else:
-            l, peak, r = find_peak_and_window(time, hf, endo=endo, smooth_width_min=smooth)
-    else:
-        l, peak, r = find_peak_and_window(time, hf, endo=endo, smooth_width_min=smooth)
-    base, mb, bb = baseline_linear(time, hf, l, r)
+    # Detección de onset por tangente ∩ base
+    tmin = window[0] if (window and len(window) == 2) else None
+    tmax = window[1] if (window and len(window) == 2) else None
+    if tmin is not None and tmax is not None:
+        n_in_win = int(np.sum((time >= tmin) & (time <= tmax)))
+        if n_in_win < 200:
+            print(f"[warn] ventana --window contiene {n_in_win} puntos (<200)")
 
-    # onset por leading-edge vs baseline
-    t_on, y_on, m_edge, b_edge, t0_fit, t1_fit = refine_onset_by_tangent(
-        time, hf, base, l, peak, r, endo=endo, edge_points=edge_points
+    t_on, idx_on, (mb, bb), (m_edge, b_edge) = detect_onset_first_cross(
+        time, hf, endo=endo,
+        tmin=tmin, tmax=tmax,
+        smooth_min=smooth,
+        base_pre_min=base_pre, base_gap_min=base_gap,
+        sigma_k=sigma_k, consec=consec, edge_halfwin_pts=edge_halfwin,
     )
+    base = mb*time + bb
     T_on = float(np.interp(t_on, time, temp))
 
-    # ΔU desde t_on hasta r
+    # ΔU desde t_on hasta el final
+    r = len(time) - 1
     area = integrate_area_from_onset(time, hf, base, t_on, r, endo=endo)
 
     # estilo
@@ -252,23 +356,16 @@ def plot_dsc(df: pd.DataFrame, outstem: Path, use_points: bool, endo: bool,
     else:
         ax.plot(time, hf, lw=2.1, color="#1f77b4", label="Heat flow")
 
-    # baseline & área (área solo si area_state == 'on')
-    ax.plot(time[l:r+1], base[l:r+1], ls="--", lw=1.7, color="#6b717e", label="Baseline")
+    # área (área solo si area_state == 'on')
     if area_state == "on":
-        ax.fill_between(time[l:r+1], hf[l:r+1], base[l:r+1],
-                        where=(time[l:r+1] >= t_on),
+        ax.fill_between(time, hf, base,
+                        where=(time >= t_on),
                         color="#9dc7e0", alpha=0.30, label=r"Area for $\Delta U$")
-
-    # Rectas auxiliares opcionales: baseline ya está; tangente si --edges
-    if edges:
-        tt = np.array([t0_fit, t1_fit])
-        yy = m_edge*tt + b_edge
-        ax.plot(tt, yy, lw=1.8, color="#555", alpha=0.9, label="Edge tangent", zorder=4)
 
     # (se elimina duplicación de trazos para evitar superposición)
 
     # --- Onset: marcador discreto (sin línea vertical)
-    ax.plot([t_on], [y_on], marker='o', ms=6, mfc='none', mec='#2ca25f', mew=1.2,
+    ax.plot([t_on], [hf[idx_on]], marker='o', ms=6, mfc='none', mec='#2ca25f', mew=1.2,
             linewidth=0, zorder=6, label="Onset")
 
     ax.set_xlabel("Time (min)")
@@ -285,6 +382,16 @@ def plot_dsc(df: pd.DataFrame, outstem: Path, use_points: bool, endo: bool,
         ax.set_xlim(xlim); ax2.set_xlim(xlim)
     else:
         ax.set_xlim(time.min(), time.max()); ax2.set_xlim(time.min(), time.max())
+
+    # Con --edges activado, dibujar baseline y tangente en todo el panel
+    if edges:
+        x0, x1 = ax.get_xlim()
+        y0 = m_edge * x0 + b_edge
+        y1 = m_edge * x1 + b_edge
+        ax.plot(time, base, linestyle="--", linewidth=1.6, color="#6b717e", alpha=0.9,
+                label="Baseline line")
+        ax.plot([x0, x1], [y0, y1], linestyle=(0, (3, 1)), linewidth=1.8, color="#8a8f99",
+                label="Edge tangent")
 
     # Marcos: sin grid, ticks hacia fuera, líneas limpias
     for a in (ax, ax2):
@@ -332,8 +439,11 @@ def plot_dsc(df: pd.DataFrame, outstem: Path, use_points: bool, endo: bool,
         f"Onset: {T_on:.2f} °C ({t_on:.2f} min)\n" +
         r"$\Delta U$: " + f"{format_du(area)} J g$^{{-1}}$"
     )
-    ax.plot([t_on], [y_on], marker="o", ms=6, mfc="none", mec="#2ca25f", mew=1.2,
+    # marcador repetido para mantener el estilo existente de la etiqueta
+    ax.plot([t_on], [hf[idx_on]], marker="o", ms=6, mfc="none", mec="#2ca25f", mew=1.2,
             zorder=6, linewidth=0, label="Onset")
+    # y_on ahora se calcula sobre la base en t_on para no cambiar la posición visual
+    y_on = (mb * t_on + bb)
     ax.annotate(
         txt,
         xy=(t_on, y_on), xycoords="data",
@@ -371,8 +481,18 @@ def parse_args():
                    help="Cierra el cuadro con línea superior sin ticks")
     p.add_argument("--window", nargs=2, type=float, metavar=("TMIN","TMAX"),
                    help="Fuerza ventana de búsqueda de pico (minutos) para onset/ΔU")
-    p.add_argument("--smooth", type=float, default=0.12, metavar="MIN",
-                   help="Ancho de suavizado (min) para detección (no se dibuja)")
+    p.add_argument("--smooth", type=float, default=0.25, metavar="MIN",
+                   help="Suavizado (min) para derivada/residuo")
+    p.add_argument("--base-pre", type=float, default=1.5,
+                   help="Min previos al frente para ajustar línea base")
+    p.add_argument("--base-gap", type=float, default=0.3,
+                   help="Separación (min) entre base y frente")
+    p.add_argument("--sigma", type=float, default=3.0,
+                   help="Umbral robusto en múltiplos de sigma (MAD)")
+    p.add_argument("--consec", type=int, default=5,
+                   help="Puntos consecutivos sobre umbral para confirmar onset")
+    p.add_argument("--edge-halfwin", type=int, default=8,
+                   help="Semiventana (puntos) para ajustar la tangente local")
     p.add_argument("--width-in", "--width_in", dest="width_in", type=float, default=4.5,
                    help="Ancho figura (in, JCED 1-col por defecto)")
     p.add_argument("--height-in", "--height_in", dest="height_in", type=float, default=2.6,
@@ -408,6 +528,11 @@ def main():
         edge_points=args.edge_points,
         edges=args.edges,
         area_state=args.area,
+        base_pre=args.base_pre,
+        base_gap=args.base_gap,
+        sigma_k=args.sigma,
+        consec=args.consec,
+        edge_halfwin=args.edge_halfwin,
     )
     print(f"Usando archivo: {args.file.name}")
     print(f"Onset: {T_on:.2f} °C (t={t_on:.2f} min)   ΔU={dU:.3f} J g^-1")
